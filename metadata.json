@@ -1,0 +1,13 @@
+{
+  "name": "Vani Notes",
+  "description": "AI-powered meeting transcription and summarization app supporting English and Hindi with multi-format export.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "Audio Recording",
+    "Multilingual Transcription (English/Hindi)",
+    "AI Summarization",
+    "PDF/Text Export"
+  ]
+}
