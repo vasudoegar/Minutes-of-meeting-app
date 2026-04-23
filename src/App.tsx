@@ -40,6 +40,7 @@ export default function App() {
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [meetingName, setMeetingName] = useState("New Meeting");
   const [isEditingName, setIsEditingName] = useState(false);
+  const [wakeLock, setWakeLock] = useState<any>(null);
   
   // Refs
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -47,13 +48,59 @@ export default function App() {
   const timerRef = useRef<NodeJS.Timeout | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const animationFrameRef = useRef<number | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
 
   // Initialize Gemini
   const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
+  // Wake Lock Logic
+  const requestWakeLock = async () => {
+    if ('wakeLock' in navigator) {
+      try {
+        const lock = await (navigator as any).wakeLock.request('screen');
+        setWakeLock(lock);
+        lock.addEventListener('release', () => {
+          setWakeLock(null);
+        });
+      } catch (err) {
+        console.error("Wake Lock failed:", err);
+      }
+    }
+  };
+
+  const releaseWakeLock = async () => {
+    if (wakeLock) {
+      await wakeLock.release();
+      setWakeLock(null);
+    }
+  };
+
+  // Audio Track Events (Auto-Pause)
+  const setupTrackListeners = (stream: MediaStream) => {
+    stream.getAudioTracks().forEach(track => {
+      track.onmute = () => {
+        if (mediaRecorderRef.current?.state === 'recording') {
+          mediaRecorderRef.current.pause();
+          setIsRecording(false); // Update UI state to show paused
+          if (timerRef.current) clearInterval(timerRef.current);
+        }
+      };
+      track.onunmute = () => {
+        if (mediaRecorderRef.current?.state === 'paused') {
+          mediaRecorderRef.current.resume();
+          setIsRecording(true);
+          timerRef.current = setInterval(() => setRecordingTime(prev => prev + 1), 1000);
+        }
+      };
+    });
+  };
+
   // Audio Visualization
   const startCanvasAnimation = (stream: MediaStream) => {
-    const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+    // Check if AudioContext exists and state
+    const AudioContextClass = (window.AudioContext || (window as any).webkitAudioContext);
+    const audioContext = new AudioContextClass();
+    
     const source = audioContext.createMediaStreamSource(stream);
     const analyser = audioContext.createAnalyser();
     analyser.fftSize = 128;
@@ -88,6 +135,7 @@ export default function App() {
     };
 
     draw();
+    return audioContext;
   };
 
   const stopCanvasAnimation = () => {
@@ -103,6 +151,8 @@ export default function App() {
     setError(null);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+      
       mediaRecorderRef.current = new MediaRecorder(stream);
       chunksRef.current = [];
 
@@ -111,24 +161,29 @@ export default function App() {
       };
 
       mediaRecorderRef.current.onstop = () => {
-        const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
+        const blob = new Blob(chunksRef.current, { type: mediaRecorderRef.current?.mimeType || 'audio/webm' });
         setAudioBlob(blob);
         setAudioUrl(URL.createObjectURL(blob));
         stopCanvasAnimation();
+        releaseWakeLock();
       };
 
       mediaRecorderRef.current.start();
       setIsRecording(true);
       startCanvasAnimation(stream);
+      requestWakeLock();
+      setupTrackListeners(stream);
     } catch (err) {
       setError("Microphone permission denied.");
     }
   };
 
   const stopRecording = () => {
-    if (mediaRecorderRef.current && isRecording) {
+    if (mediaRecorderRef.current && (isRecording || mediaRecorderRef.current.state === 'paused')) {
       mediaRecorderRef.current.stop();
-      mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop());
+      }
       setIsRecording(false);
     }
   };
@@ -136,6 +191,10 @@ export default function App() {
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
+      // Check file size for 1hr meetings - warn if > 50MB
+      if (file.size > 50 * 1024 * 1024) {
+        setError("Warning: File is very large. Processing might fail due to AI API limits (20MB for direct sync).");
+      }
       setAudioBlob(file);
       setAudioUrl(URL.createObjectURL(file));
       setError(null);
@@ -171,15 +230,18 @@ export default function App() {
           {
             parts: [
               {
-                text: "You are an expert meeting minute taker. The provided audio contains a conversation that may switch between English and Hindi. \n\n" +
-                      "Task:\n" +
-                      "1. TRANSCRIBE the entire meeting accurately in English. Translate any Hindi spoken parts into English directly within the transcript.\n" +
-                      "2. SUMMARIZE the meeting with clear sections: MEETING INFO, KEY POINTS, DECISIONS, and ACTION ITEMS.\n\n" +
-                      "Format the final output cleanly in Markdown. Use hierarchical headers and bullet points."
+                text: "You are a faithful and accurate meeting assistant. Your goal is to provide a grounded transcription and summary of the PROVIDED audio file only.\n\n" +
+                      "STRICT INSTRUCTIONS:\n" +
+                      "1. TRANSCRIBE only what is actually spoken in the audio. Do NOT add, invent, or hallucinate any characters, names, or corporate contexts that are not explicitly heard.\n" +
+                      "2. If the audio is very short (e.g., just 'Hello'), only transcribe those specific words.\n" +
+                      "3. If the audio is silent or unintelligible, do NOT generate a transcript. Instead, reply: 'The audio appears to be silent or contains no recognizable speech.'\n" +
+                      "4. Translate any Hindi segments into English accurately.\n" +
+                      "5. After the transcript, provide a concise SUMMARY only if there is sufficient content to summarize (MEETING INFO, KEY POINTS, DECISIONS, ACTION ITEMS).\n\n" +
+                      "Your output must be strictly honest to the source audio."
               },
               {
                 inlineData: {
-                  mimeType: audioBlob.type || 'audio/webm',
+                  mimeType: audioBlob.type || 'audio/mpeg',
                   data: base64Data
                 }
               }
@@ -296,8 +358,8 @@ export default function App() {
                 </li>
                 <li>
                   <label className="w-full flex items-center gap-3 p-2 rounded-md transition-all text-sm font-medium text-slate-600 hover:bg-slate-50 cursor-pointer">
-                    <Upload className="w-4 h-4" /> Upload Audio
-                    <input type="file" accept="audio/*" onChange={handleFileUpload} className="hidden" />
+                    <Upload className="w-4 h-4" /> Upload Recording
+                    <input type="file" accept="audio/*,video/*,.m4a,.mp3,.wav,.mp4" onChange={handleFileUpload} className="hidden" />
                   </label>
                 </li>
                 <li>
@@ -310,20 +372,6 @@ export default function App() {
                   >
                     <History className="w-4 h-4" /> Meeting Logs
                   </button>
-                </li>
-              </ul>
-            </div>
-
-            <div>
-              <p className="text-xs font-semibold text-slate-400 uppercase tracking-widest mb-4">Pinned Notes</p>
-              <ul className="space-y-2 text-slate-600">
-                <li className="flex items-center justify-between group cursor-pointer hover:text-indigo-600 p-2 -mx-2 rounded-md">
-                  <span className="truncate text-sm">Product Q3 Sync</span>
-                  <ChevronRight className="w-3 h-3 opacity-0 group-hover:opacity-100 transition-opacity" />
-                </li>
-                <li className="flex items-center justify-between group cursor-pointer hover:text-indigo-600 p-2 -mx-2 rounded-md">
-                  <span className="truncate text-sm">Client Pitch - Mumbai</span>
-                  <ChevronRight className="w-3 h-3 opacity-0 group-hover:opacity-100 transition-opacity" />
                 </li>
               </ul>
             </div>
